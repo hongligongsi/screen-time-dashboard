@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+*.ico
+_temp/
+temp/
+logs/
+screenshot.png
+generate_icon.py
