@@ -26,6 +26,24 @@ except:
 DATA_DIR = Path(os.environ["APPDATA"]) / "ScreenTime"
 DB_PATH = DATA_DIR / "screentime.db"
 
+# ============ 浏览器标题清洗 ============
+import re
+
+BROWSER_SUFFIX_PATTERNS = [
+    re.compile(r"\s*[-–—]\s*(Google\s*Chrome|Mozilla\s*Firefox|Microsoft\s*Edge|Opera|Brave|Vivaldi|Arc|Chromium)$", re.IGNORECASE),
+    re.compile(r"\s*[-–—]\s*(Google\s*Chrome|Firefox|Edge|Opera|Brave)$", re.IGNORECASE),
+]
+
+def clean_browser_title(title):
+    """移除浏览器标题中的浏览器名称后缀"""
+    if not title:
+        return title
+    for pat in BROWSER_SUFFIX_PATTERNS:
+        title = pat.sub("", title).strip()
+    # 移除可能残留的前后空白和破折号
+    title = re.sub(r"\s*[-–—]\s*$", "", title).strip()
+    return title
+
 # ============ 空闲检测 ============
 class IdleDetector:
     """通过 pynput 监听键盘鼠标，判断用户是否离开"""
@@ -307,6 +325,9 @@ class DataStore:
         # v2: 浏览器标签页记录
         cur.execute("CREATE TABLE IF NOT EXISTS browser_tabs (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, time TEXT NOT NULL, process_name TEXT NOT NULL, window_title TEXT)")
 
+        # v3: 浏览器标签页标题采集
+        cur.execute("CREATE TABLE IF NOT EXISTS browser_tab_log (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, process_name TEXT NOT NULL, tab_title TEXT)")
+
         # v2: 系统指标记录
         cur.execute("CREATE TABLE IF NOT EXISTS system_metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, cpu_percent REAL DEFAULT 0, mem_percent REAL DEFAULT 0, cpu_cores INTEGER DEFAULT 0, gpu_percent REAL DEFAULT 0, mem_used_gb REAL DEFAULT 0)")
 
@@ -324,17 +345,37 @@ class DataStore:
         conn.close()
     
     def save_daily_app_usage(self, date_str, app_data):
-        """app_data: {process_name: {foreground_seconds, background_seconds, switch_count, notification_count}}"""
+        """app_data: {process_name: {foreground_seconds, background_seconds, switch_count, notification_count}}
+        使用 INSERT OR REPLACE 原地更新，避免 DELETE 导致重启时数据丢失。"""
         conn = sqlite3.connect(str(DB_PATH))
         cur = conn.cursor()
-        cur.execute("DELETE FROM app_daily_usage WHERE date=?", (date_str,))
         for proc, data in app_data.items():
             cur.execute(
-                "INSERT INTO app_daily_usage (date, process_name, foreground_seconds, background_seconds, switch_count, notification_count) VALUES (?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO app_daily_usage (date, process_name, foreground_seconds, background_seconds, switch_count, notification_count) VALUES (?,?,?,?,?,?)",
                 (date_str, proc, data['foreground_seconds'], data['background_seconds'], data['switch_count'], data['notification_count'])
             )
         conn.commit()
         conn.close()
+
+    def load_today_app_usage(self, date_str):
+        """加载当天已有的 app_daily_usage 数据，用于重启后接续累积数据。"""
+        conn = sqlite3.connect(str(DB_PATH))
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT process_name, foreground_seconds, background_seconds, switch_count, notification_count FROM app_daily_usage WHERE date=?",
+            (date_str,)
+        )
+        rows = cur.fetchall()
+        conn.close()
+        data = {}
+        for row in rows:
+            data[row[0]] = {
+                'foreground_seconds': row[1] or 0,
+                'background_seconds': row[2] or 0,
+                'switch_count': row[3] or 0,
+                'notification_count': row[4] or 0,
+            }
+        return data
     
     def save_notifications(self, notifications):
         conn = sqlite3.connect(str(DB_PATH))
@@ -369,6 +410,30 @@ class DataStore:
         )
         conn.commit()
         conn.close()
+    
+    def save_browser_tab_log(self, timestamp, process_name, title):
+        conn = sqlite3.connect(str(DB_PATH))
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO browser_tab_log (timestamp, process_name, tab_title) VALUES (?,?,?)",
+            (timestamp, process_name, title[:300])
+        )
+        conn.commit()
+        conn.close()
+    
+    def notify_websocket(self):
+        """通知 WebSocket 服务器有新数据"""
+        try:
+            import urllib.request
+            import json
+            data = json.dumps({"event": "data_update"}).encode()
+            req = urllib.request.Request(
+                "http://127.0.0.1:19999/api/today",
+                method="GET"
+            )
+            urllib.request.urlopen(req, timeout=2)
+        except:
+            pass
     
     def save_system_metrics(self, cpu, mem, mem_gb, gpu, cores):
         conn = sqlite3.connect(str(DB_PATH))
@@ -437,6 +502,10 @@ def main():
         'switch_count': 0, 'notification_count': 0
     })
     today_str = datetime.now().strftime("%Y-%m-%d")
+    # 启动时加载当天已有数据，避免重启后 INSERT OR REPLACE 覆盖掉之前的累积值
+    existing = data_store.load_today_app_usage(today_str)
+    for proc, d in existing.items():
+        daily_app_data[proc].update(d)
     notifications_collected = False
     
     # 新功能计数器
@@ -477,7 +546,7 @@ def main():
             active_accumulated += elapsed
             minute_active += elapsed
             proc, title, pid = window_tracker.get_active_info()
-            if proc:
+            if proc and proc.strip():
                 daily_app_data[proc]['foreground_seconds'] += elapsed
                 if proc != last_process:
                     minute_switches[proc] += 1
@@ -488,16 +557,18 @@ def main():
                 if proc in BROWSER_PROCS and title and (tick - last_tab_capture > 30):
                     tab_key = proc + title
                     if tab_key not in tab_minute_tracker.get(now_minute, set()):
-                        data_store.save_browser_tab(now_date, now.strftime("%H:%M:%S"), proc, title)
+                        data_store.save_browser_tab(now_date, now.strftime("%H:%M:%S"), proc, clean_browser_title(title))
                         tab_minute_tracker.setdefault(now_minute, set()).add(tab_key)
+                    # 写入新的 browser_tab_log 表
+                    data_store.save_browser_tab_log(now.strftime("%Y-%m-%d %H:%M:%S"), proc, clean_browser_title(title))
                     last_tab_capture = tick
-                
-                # 系统指标采集（每 30 秒一次）
-                if tick - last_metrics_capture > 30:
-                    cpu, mem, mem_gb, gpu, cores = metrics_collector.get_metrics()
-                    if cpu > 0 or mem > 0:
-                        data_store.save_system_metrics(cpu, mem, mem_gb, gpu, cores)
-                    last_metrics_capture = tick
+        
+        # 系统指标采集（每 30 秒一次，不受空闲影响）
+        if tick - last_metrics_capture > 30:
+            cpu, mem, mem_gb, gpu, cores = metrics_collector.get_metrics()
+            if cpu > 0 or mem > 0:
+                data_store.save_system_metrics(cpu, mem, mem_gb, gpu, cores)
+            last_metrics_capture = tick
         
         # 音频检测（每 60 秒一次）
         if tick - last_audio_capture > 60:

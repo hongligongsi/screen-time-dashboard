@@ -1,20 +1,27 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-""" Screen Time - Web Dashboard v2 """
+""" Screen Time - Web Dashboard v3 """
 import os, sys, json, sqlite3, time, csv, io
 from datetime import datetime, timedelta
 from pathlib import Path
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, send_file
+from flask_socketio import SocketIO, emit
 
 DATA_DIR = Path(os.environ["APPDATA"]) / "ScreenTime"
 DB_PATH = DATA_DIR / "screentime.db"
-HTML_PATH = Path(__file__).parent / "index.html"
+BASE_DIR = Path(__file__).parent
+HTML_PATH = BASE_DIR / "index.html"
+MANIFEST_PATH = BASE_DIR / "manifest.json"
+SW_PATH = BASE_DIR / "sw.js"
+ECHARTS_PATH = BASE_DIR / "echarts.min.js"
 
 INDEX_HTML = ""
 if HTML_PATH.exists():
     INDEX_HTML = HTML_PATH.read_text(encoding="utf-8")
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'screentime-secret-key'
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 def get_db():
     conn = sqlite3.connect(str(DB_PATH))
@@ -33,17 +40,32 @@ def init_db():
         PRIMARY KEY (date, process_name))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS daily_summary (
         date TEXT PRIMARY KEY, total_active_seconds INTEGER DEFAULT 0,
-        total_idle_seconds INTEGER DEFAULT 0)""")
+        total_idle_seconds INTEGER DEFAULT 0, raw_data TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS notifications (
         id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, time TEXT, app_name TEXT, title TEXT, body TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS browser_tabs (
         id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, time TEXT, process_name TEXT, window_title TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS system_metrics (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT, cpu_percent REAL, mem_percent REAL)""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, cpu_percent REAL DEFAULT 0, mem_percent REAL DEFAULT 0,
+        cpu_cores INTEGER DEFAULT 0, gpu_percent REAL DEFAULT 0, mem_used_gb REAL DEFAULT 0)""")
+    # 迁移：为旧表补全 tracker 写入的列
+    for col, col_def in [('gpu_percent', 'REAL DEFAULT 0'), ('mem_used_gb', 'REAL DEFAULT 0'), ('cpu_cores', 'INTEGER DEFAULT 0')]:
+        try:
+            cur.execute(f"ALTER TABLE system_metrics ADD COLUMN {col} {col_def}")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+    # 迁移：daily_summary 旧表补 raw_data
+    try:
+        cur.execute("ALTER TABLE daily_summary ADD COLUMN raw_data TEXT")
+    except sqlite3.OperationalError:
+        pass
     cur.execute("""CREATE TABLE IF NOT EXISTS app_categories (
         process_name TEXT PRIMARY KEY, category TEXT, category_zh TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS usage_limits (
         process_name TEXT PRIMARY KEY, daily_limit_minutes INTEGER DEFAULT 120, enabled INTEGER DEFAULT 1)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS browser_tab_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
+        process_name TEXT NOT NULL, tab_title TEXT)""")
     cats = [
         ('chrome.exe','browser','\u6d4f\u89c8\u5668'),('msedge.exe','browser','\u6d4f\u89c8\u5668'),('firefox.exe','browser','\u6d4f\u89c8\u5668'),
         ('winword.exe','office','\u529e\u516c'),('excel.exe','office','\u529e\u516c'),('powerpnt.exe','office','\u529e\u516c'),
@@ -79,6 +101,24 @@ def today_str():
 def index():
     return INDEX_HTML
 
+@app.route("/manifest.json")
+def manifest():
+    if MANIFEST_PATH.exists():
+        return Response(MANIFEST_PATH.read_text(encoding="utf-8"), mimetype='application/json')
+    return jsonify({"error": "manifest not found"}), 404
+
+@app.route("/sw.js")
+def service_worker():
+    if SW_PATH.exists():
+        return Response(SW_PATH.read_text(encoding="utf-8"), mimetype='application/javascript')
+    return jsonify({"error": "sw not found"}), 404
+
+@app.route("/echarts.min.js")
+def echarts_js():
+    if ECHARTS_PATH.exists():
+        return Response(ECHARTS_PATH.read_bytes(), mimetype='application/javascript')
+    return jsonify({"error": "echarts not found"}), 404
+
 @app.route("/api/today")
 def api_today():
     today = today_str()
@@ -89,6 +129,9 @@ def api_today():
     for h in range(24):
         row = query_db("SELECT SUM(duration_seconds) as sec FROM usage_log WHERE date=? AND time LIKE ?", (today, f"{h:02d}:%"), single=True)
         hourly.append(row['sec'] if row and row['sec'] else 0)
+    # 兜底：app_daily_usage 为空但 usage_log 有数据时，用 hourly 总和作为 fallback
+    if total_active == 0 and sum(hourly) > 0:
+        total_active = sum(hourly)
     notif_count = query_db("SELECT COUNT(*) as cnt FROM notifications WHERE date=?", (today,), single=True)
     ds = query_db("SELECT total_idle_seconds FROM daily_summary WHERE date=?", (today,), single=True)
     cats = query_db(
@@ -288,7 +331,7 @@ def api_history():
 def api_system():
     today = today_str()
     latest = query_db("SELECT * FROM system_metrics ORDER BY id DESC LIMIT 1", single=True)
-    recent = query_db("SELECT time, cpu_percent, mem_percent FROM system_metrics WHERE time >= datetime('now','-10 minutes') ORDER BY id DESC LIMIT 10")
+    recent = query_db("SELECT time, cpu_percent, mem_percent, gpu_percent, mem_used_gb, cpu_cores FROM system_metrics WHERE time >= datetime('now','-10 minutes') ORDER BY id DESC LIMIT 10")
     avg = query_db("SELECT AVG(cpu_percent) as cpu, AVG(mem_percent) as mem FROM system_metrics WHERE time >= datetime('now','-10 minutes')", single=True)
     return jsonify({
         'latest': latest,
@@ -303,6 +346,16 @@ def api_browser_tabs():
     count = query_db("SELECT COUNT(*) as cnt FROM browser_tabs WHERE date=?", (today,), single=True)
     tabs = query_db("SELECT time, process_name, window_title FROM browser_tabs WHERE date=? ORDER BY time DESC LIMIT 20", (today,))
     return jsonify({'count': count['cnt'] if count else 0, 'tabs': tabs})
+
+@app.route("/api/browser-tab-history")
+def api_browser_tab_history():
+    today = today_str()
+    tabs = query_db(
+        "SELECT id, timestamp, process_name, tab_title FROM browser_tab_log "
+        "WHERE timestamp LIKE ? ORDER BY timestamp DESC LIMIT 50",
+        (today + '%',)
+    )
+    return jsonify({'tabs': tabs, 'count': len(tabs)})
 
 @app.route("/api/weekly-summary")
 def api_weekly_summary():
@@ -326,6 +379,53 @@ def api_weekly_summary():
         'this_week_days': min((today - this_mon).days + 1, 7),
         'last_week_days': 7
     })
+
+@app.route("/api/anomalies")
+def api_anomalies():
+    """Detect anomalies: CPU high, memory high, app overuse, late-night activity."""
+    today = today_str()
+    anomalies = []
+
+    # 1. CPU consecutive 3 points > 80%
+    cpu_rows = query_db(
+        "SELECT cpu_percent FROM system_metrics WHERE time >= datetime('now','-30 minutes') ORDER BY id DESC LIMIT 20")
+    high_cpu_streak = 0
+    max_cpu_streak = 0
+    for r in cpu_rows:
+        v = r.get('cpu_percent') or 0
+        if v > 80:
+            high_cpu_streak += 1
+            max_cpu_streak = max(max_cpu_streak, high_cpu_streak)
+        else:
+            high_cpu_streak = 0
+    if max_cpu_streak >= 3:
+        anomalies.append({'type': 'cpu_high', 'message': 'CPU连续3个采集点 > 80%'})
+
+    # 2. Memory > 90%
+    mem_row = query_db("SELECT mem_percent FROM system_metrics ORDER BY id DESC LIMIT 1", single=True)
+    if mem_row and (mem_row.get('mem_percent') or 0) > 90:
+        anomalies.append({'type': 'mem_high', 'message': '内存使用率 > 90%'})
+
+    # 3. App single day > 6h
+    overuse = query_db(
+        "SELECT process_name, foreground_seconds FROM app_daily_usage WHERE date=? AND foreground_seconds > 21600",
+        (today,))
+    for r in overuse:
+        anomalies.append({
+            'type': 'app_overuse',
+            'process_name': r['process_name'],
+            'seconds': r['foreground_seconds'],
+            'message': f"{r['process_name']} 单日使用 > 6h"
+        })
+
+    # 4. Late-night (0-6) activity > 30min
+    late_secs = query_db(
+        "SELECT SUM(duration_seconds) as sec FROM usage_log WHERE date=? AND time >= '00:00' AND time < '06:00'",
+        (today,), single=True)
+    if late_secs and (late_secs.get('sec') or 0) > 1800:
+        anomalies.append({'type': 'late_active', 'seconds': late_secs['sec'], 'message': '深夜0-6点活跃 > 30min'})
+
+    return jsonify({'anomalies': anomalies, 'count': len(anomalies)})
 
 @app.route("/api/streaks")
 def api_streaks():
@@ -351,5 +451,16 @@ def api_streaks():
     
     return jsonify({'current_streak': streak, 'min_active_seconds': 600, 'today_active': today_data['total_active_seconds'] if today_data else 0})
 
+# ============ WebSocket Events ============
+@socketio.on('connect')
+def handle_connect():
+    """Client connected - acknowledge"""
+    emit('connected', {'status': 'ok', 'message': 'WebSocket connected'})
+
+@socketio.on('request_refresh')
+def handle_refresh(data=None):
+    """A client or tracker requests that all clients refresh"""
+    socketio.emit('data_update', {'timestamp': datetime.now().isoformat()})
+
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=19999, debug=False)
+    socketio.run(app, host="127.0.0.1", port=19999, debug=False, allow_unsafe_werkzeug=True)
