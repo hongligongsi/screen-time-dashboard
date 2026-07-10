@@ -1,0 +1,17 @@
+{
+  "name": "屏幕使用时间",
+  "short_name": "ScreenTime",
+  "description": "屏幕使用时间追踪仪表盘",
+  "start_url": "/",
+  "display": "standalone",
+  "theme_color": "#0d1117",
+  "background_color": "#0d1117",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "64x64",
+      "type": "image/x-icon"
+    }
+  ]
+}

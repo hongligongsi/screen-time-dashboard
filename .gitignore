@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.ico
+_temp/
+temp/
+logs/
+node_modules/
+*.log
+screenshot.png
+generate_icon.py
+*.db
